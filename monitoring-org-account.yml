@@ -1,0 +1,226 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Multi-account root user activity monitoring solution
+
+Parameters:
+  EmailIdtoNotify:
+    Type: String
+    Default: example@corp.com
+  MonitoringAccountId:
+    Type: String
+    Description: AWS Account ID where monitoring is centralized
+  OrganizationId:
+    Type: String
+    Description: AWS Organizations ID (e.g., o-xxxxxxxxxx)
+
+Conditions:
+  IsMonitoringAccount: !Equals 
+    - !Ref AWS::AccountId
+    - !Ref MonitoringAccountId
+  IsMemberAccount: !Not 
+    - !Equals 
+      - !Ref AWS::AccountId
+      - !Ref MonitoringAccountId
+
+Resources:
+  # Central Account Resources
+  CentralEventBus:
+    Condition: IsMonitoringAccount
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: RootActivityMonitorBus
+      EventBusPolicy:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: events:PutEvents
+            Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/RootActivityMonitorBus
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+
+  # SNS Topic
+  RootActivitySNSTopic:
+    Condition: IsMonitoringAccount
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Root-ALERT
+      Subscription:
+        - Endpoint: !Ref EmailIdtoNotify
+          Protocol: email
+      TopicName: RootActivitySNSTopic
+
+  # IAM Role for Lambda
+  LambdaRootAPIMonitorRole:
+    Condition: IsMonitoringAccount
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaSNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref RootActivitySNSTopic
+
+  # Event Forwarding Role for Member Accounts
+  EventForwardingRole:
+    Condition: IsMemberAccount
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeForwardingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub arn:aws:events:${AWS::Region}:${MonitoringAccountId}:event-bus/RootActivityMonitorBus
+
+  # Lambda Function
+  RootActivityLambda:
+    Condition: IsMonitoringAccount
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+
+          def lambda_handler(event, context):
+              print("Event:", json.dumps(event))
+              snsARN = os.environ['SNSARN']
+              
+              # Extract account details from event
+              user = event['detail']['userIdentity']['type']
+              account_id = event['detail']['userIdentity']['accountId']
+              time_stamp = event['time']
+              source_ip = event['detail'].get('sourceIPAddress', 'N/A')
+              
+              if user == 'Root':
+                  try:
+                      message = f"""⚠️ ROOT LOGIN ALERT ⚠️
+                      
+                      Root account credentials were used to log into AWS.
+                      
+                      Account ID: {account_id}
+                      Time: {time_stamp}
+                      Source IP: {source_ip}
+                      
+                      Please investigate this activity immediately if it was not authorized.
+                      
+                      Best practices:
+                      1. Enable MFA for root account
+                      2. Store root credentials securely
+                      3. Use IAM users for daily operations
+                      
+                      - AWS Security Monitoring"""
+                      
+                      sns = boto3.client('sns')
+                      sns.publish(
+                          TopicArn=snsARN,
+                          Subject=f"🚨 Root Login Detected - Account {account_id}",
+                          Message=message
+                      )
+                      print(f"Alert sent for root login in account {account_id}")
+                  except ClientError as e:
+                      print(f"Error sending notification: {e}")
+                      raise
+              
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRootAPIMonitorRole.Arn
+      Runtime: python3.10
+      Timeout: 300
+      Environment:
+        Variables:
+          SNSARN: !Ref RootActivitySNSTopic
+
+  # Central Events Rule
+  CentralEventsRule:
+    Condition: IsMonitoringAccount
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref CentralEventBus
+      Description: Central rule for processing root activity events
+      EventPattern:
+        source:
+          - aws.signin
+        detail-type:
+          - AWS Console Sign In via CloudTrail
+        detail:
+          userIdentity:
+            type:
+              - Root
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RootActivityLambda.Arn
+          Id: TriggerLambda
+
+  # Lambda Permission for EventBridge
+  LambdaPermission:
+    Condition: IsMonitoringAccount
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RootActivityLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CentralEventsRule.Arn
+
+  # Member Account Event Rule
+  MemberEventRule:
+    Condition: IsMemberAccount
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Forward root login events to central monitoring account
+      EventPattern:
+        detail-type:
+          - AWS Console Sign In via CloudTrail
+        detail:
+          userIdentity:
+            type:
+              - Root
+      State: ENABLED
+      Targets:
+        - Arn: !Sub arn:aws:events:${AWS::Region}:${MonitoringAccountId}:event-bus/RootActivityMonitorBus
+          Id: ForwardToMonitoring
+          RoleArn: !GetAtt EventForwardingRole.Arn
+
+Outputs:
+  CentralEventBusArn:
+    Condition: IsMonitoringAccount
+    Value: !GetAtt CentralEventBus.Arn
+    Description: Central event bus ARN for root activity monitoring
+
+  LambdaRoleArn:
+    Condition: IsMonitoringAccount
+    Value: !GetAtt LambdaRootAPIMonitorRole.Arn
+    Description: Lambda execution role ARN
+
+  EventForwardingRoleArn:
+    Condition: IsMemberAccount
+    Value: !GetAtt EventForwardingRole.Arn
+    Description: Event forwarding role ARN
+
+  LambdaFunctionArn:
+    Condition: IsMonitoringAccount
+    Value: !GetAtt RootActivityLambda.Arn
+    Description: Lambda function ARN
